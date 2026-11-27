@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shlex
 import subprocess  # nosec B404 - subprocess is required for task execution
 
 from datetime import datetime
@@ -42,7 +41,11 @@ def init_globals(config_file: str, history_path: Path) -> None:
 
 def _sanitize_command(cmd_list: list[str]) -> list[str]:
     """
-    Sanitize command arguments to prevent command injection.
+    Return the command arguments as a list of literal strings.
+
+    subprocess.run is called without a shell, so each element is passed to
+    the executable verbatim. Shell quoting would be treated as part of the
+    argument value and corrupt it, so no quoting is applied here.
 
     Parameters
     ----------
@@ -52,9 +55,9 @@ def _sanitize_command(cmd_list: list[str]) -> list[str]:
     Returns
     -------
     list of str
-        Sanitized list of command arguments.
+        The command arguments, unchanged.
     """
-    return [shlex.quote(str(arg)) for arg in cmd_list]
+    return [str(arg) for arg in cmd_list]
 
 
 def log_execution(
