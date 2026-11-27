@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 from pathlib import Path
+from textwrap import dedent, indent
 from typing import Any
 
 import makim
@@ -14,7 +15,7 @@ import pytest
 def _write_config(tmp_path: Path, yaml_text: str) -> Path:
     """Write a temporary Makim YAML configuration file."""
     cfg_path = tmp_path / '.makim.yaml'
-    cfg_path.write_text(yaml_text, encoding='utf-8')
+    cfg_path.write_text(dedent(yaml_text).lstrip(), encoding='utf-8')
     return cfg_path
 
 
@@ -26,6 +27,66 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in lines if line.strip()]
 
 
+def _write_failing_hook_isolation_config(
+    tmp_path: Path,
+    out_file: Path,
+    failing_hook_extra: str,
+) -> Path:
+    """Build config shared by hook failure and exception isolation tests."""
+    out_posix = out_file.as_posix()
+    hook_body = indent(dedent(failing_hook_extra).strip('\n'), ' ' * 16)
+    return _write_config(
+        tmp_path,
+        f"""
+        groups:
+          helper:
+            vars:
+              mode: "helper"
+            env:
+              EXEC_MODE: "corrupted_helper"
+            tasks:
+              failing-hook:
+{hook_body}
+              verify-after:
+                args:
+                  mode-arg:
+                    type: string
+                    help: Mode arg from parent env
+                run: |
+                  import os
+                  poison = os.environ.get('POISON', 'clean')
+                  msg = 'after:${{{{ args.mode_arg }}}}:' + poison
+                  with open({out_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write(msg + '\\n')
+          deploy:
+            vars:
+              mode: "parent"
+            env:
+              EXEC_MODE: "prod_mode"
+            tasks:
+              ship:
+                vars:
+                  parent_only: "yes"
+                hooks:
+                  pre-run:
+                    - task: helper.failing-hook
+                    - task: helper.verify-after
+                      if: >-
+                        ${{{{
+                          vars.mode == "parent"
+                          and vars.parent_only == "yes"
+                        }}}}
+                      args:
+                        mode-arg: "${{{{ env.EXEC_MODE }}}}"
+                run: |
+                  import os
+                  poison = os.environ.get('POISON', 'clean')
+                  with open({out_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('parent:' + poison + '\\n')
+        """,
+    )
+
+
 def test_sequential_pre_run_hooks_preserve_parent_and_hook_contexts(
     tmp_path: Path,
 ) -> None:
@@ -35,122 +96,115 @@ def test_sequential_pre_run_hooks_preserve_parent_and_hook_contexts(
     hook arguments, and prevention of env leakage from Hook 1 to Hook 2+.
     """
     events_file = tmp_path / 'events.jsonl'
+    events_posix = events_file.as_posix()
     cfg = _write_config(
         tmp_path,
         f"""
-groups:
-  helper:
-    vars:
-      env_name: "helper_dev"
-      group_var: "helper_group_val"
-    env:
-      HELPER_GROUP_ENV: "helper_group_env"
-    tasks:
-      hook-one:
-        vars:
-          hook_var: "from_hook_one"
-        env:
-          HOOK_OWN_ENV: "hook1_own"
-          SHARED_STAGE: "corrupted_from_hook1"
-          LEAKED_ENV: "hook1_secret"
-        backend: bash
-        run: |
-          python3 -c '
-          import json, os
-          rec = {{
-              "step": "hook1",
-              "parent_only_env": os.environ.get("PARENT_ONLY_ENV", ""),
-              "helper_group_env": os.environ.get("HELPER_GROUP_ENV", ""),
-              "shared_stage": os.environ.get("SHARED_STAGE", ""),
-              "hook_own_env": os.environ.get("HOOK_OWN_ENV", ""),
-              "group_var": "${{{{ vars.group_var }}}}",
-              "hook_var": "${{{{ vars.hook_var }}}}",
-          }}
-          with open("{events_file}", "a") as f:
-              f.write(json.dumps(rec) + "\\n")
-          '
-      hook-two:
-        vars:
-          hook_var: "from_hook_two"
-        env:
-          HOOK_OWN_ENV: "hook2_own"
-        args:
-          stage:
-            type: string
-            help: Parent shared stage passed via hook args
-            default: "missing"
-        backend: bash
-        run: |
-          python3 -c '
-          import json, os
-          rec = {{
-              "step": "hook2",
-              "parent_only_env": os.environ.get("PARENT_ONLY_ENV", ""),
-              "helper_group_env": os.environ.get("HELPER_GROUP_ENV", ""),
-              "shared_stage": os.environ.get("SHARED_STAGE", ""),
-              "hook_own_env": os.environ.get("HOOK_OWN_ENV", ""),
-              "leaked_env": os.environ.get("LEAKED_ENV", "clean"),
-              "stage_arg": "${{{{ args.stage }}}}",
-              "group_var": "${{{{ vars.group_var }}}}",
-              "hook_var": "${{{{ vars.hook_var }}}}",
-          }}
-          with open("{events_file}", "a") as f:
-              f.write(json.dumps(rec) + "\\n")
-          '
-      hook-three:
-        args:
-          stage:
-            type: string
-            help: Parent shared stage passed to third hook
-            default: "missing"
-        backend: bash
-        run: |
-          python3 -c '
-          import json, os
-          rec = {{
-              "step": "hook3",
-              "parent_only_env": os.environ.get("PARENT_ONLY_ENV", ""),
-              "shared_stage": os.environ.get("SHARED_STAGE", ""),
-              "stage_arg": "${{{{ args.stage }}}}",
-              "leaked_env": os.environ.get("LEAKED_ENV", "clean"),
-          }}
-          with open("{events_file}", "a") as f:
-              f.write(json.dumps(rec) + "\\n")
-          '
-  deploy:
-    vars:
-      env_name: "production"
-    env:
-      PARENT_ONLY_ENV: "prod_group_env"
-    tasks:
-      ship:
-        vars:
-          deploy_tier: "primary"
-        env:
-          SHARED_STAGE: "prod_task_stage"
-        hooks:
-          pre-run:
-            - task: helper.hook-one
-            - task: helper.hook-two
-              args:
-                stage: "${{{{ env.SHARED_STAGE }}}}"
-            - task: helper.hook-three
-              args:
-                stage: "${{{{ env.SHARED_STAGE }}}}"
-        backend: bash
-        run: |
-          python3 -c '
-          import json, os
-          rec = {{
-              "step": "parent",
-              "parent_only_env": os.environ.get("PARENT_ONLY_ENV", ""),
-              "shared_stage": os.environ.get("SHARED_STAGE", ""),
-              "leaked_env": os.environ.get("LEAKED_ENV", "clean"),
-          }}
-          with open("{events_file}", "a") as f:
-              f.write(json.dumps(rec) + "\\n")
-          '
-""",
+        groups:
+          helper:
+            vars:
+              env_name: "helper_dev"
+              group_var: "helper_group_val"
+            env:
+              HELPER_GROUP_ENV: "helper_group_env"
+            tasks:
+              hook-one:
+                vars:
+                  hook_var: "from_hook_one"
+                env:
+                  HOOK_OWN_ENV: "hook1_own"
+                  SHARED_STAGE: "corrupted_from_hook1"
+                  LEAKED_ENV: "hook1_secret"
+                run: |
+                  import json
+                  import os
+                  rec = dict(
+                      step='hook1',
+                      parent_only_env=os.environ.get('PARENT_ONLY_ENV', ''),
+                      helper_group_env=os.environ.get('HELPER_GROUP_ENV', ''),
+                      shared_stage=os.environ.get('SHARED_STAGE', ''),
+                      hook_own_env=os.environ.get('HOOK_OWN_ENV', ''),
+                      group_var='${{{{ vars.group_var }}}}',
+                      hook_var='${{{{ vars.hook_var }}}}',
+                  )
+                  with open({events_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write(json.dumps(rec) + '\\n')
+              hook-two:
+                vars:
+                  hook_var: "from_hook_two"
+                env:
+                  HOOK_OWN_ENV: "hook2_own"
+                args:
+                  stage:
+                    type: string
+                    help: Parent shared stage passed via hook args
+                    default: "missing"
+                run: |
+                  import json
+                  import os
+                  rec = dict(
+                      step='hook2',
+                      parent_only_env=os.environ.get('PARENT_ONLY_ENV', ''),
+                      helper_group_env=os.environ.get('HELPER_GROUP_ENV', ''),
+                      shared_stage=os.environ.get('SHARED_STAGE', ''),
+                      hook_own_env=os.environ.get('HOOK_OWN_ENV', ''),
+                      leaked_env=os.environ.get('LEAKED_ENV', 'clean'),
+                      stage_arg='${{{{ args.stage }}}}',
+                      group_var='${{{{ vars.group_var }}}}',
+                      hook_var='${{{{ vars.hook_var }}}}',
+                  )
+                  with open({events_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write(json.dumps(rec) + '\\n')
+              hook-three:
+                args:
+                  stage:
+                    type: string
+                    help: Parent shared stage passed to third hook
+                    default: "missing"
+                run: |
+                  import json
+                  import os
+                  rec = dict(
+                      step='hook3',
+                      parent_only_env=os.environ.get('PARENT_ONLY_ENV', ''),
+                      shared_stage=os.environ.get('SHARED_STAGE', ''),
+                      stage_arg='${{{{ args.stage }}}}',
+                      leaked_env=os.environ.get('LEAKED_ENV', 'clean'),
+                  )
+                  with open({events_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write(json.dumps(rec) + '\\n')
+          deploy:
+            vars:
+              env_name: "production"
+            env:
+              PARENT_ONLY_ENV: "prod_group_env"
+            tasks:
+              ship:
+                vars:
+                  deploy_tier: "primary"
+                env:
+                  SHARED_STAGE: "prod_task_stage"
+                hooks:
+                  pre-run:
+                    - task: helper.hook-one
+                    - task: helper.hook-two
+                      args:
+                        stage: "${{{{ env.SHARED_STAGE }}}}"
+                    - task: helper.hook-three
+                      args:
+                        stage: "${{{{ env.SHARED_STAGE }}}}"
+                run: |
+                  import json
+                  import os
+                  rec = dict(
+                      step='parent',
+                      parent_only_env=os.environ.get('PARENT_ONLY_ENV', ''),
+                      shared_stage=os.environ.get('SHARED_STAGE', ''),
+                      leaked_env=os.environ.get('LEAKED_ENV', 'clean'),
+                  )
+                  with open({events_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write(json.dumps(rec) + '\\n')
+        """,
     )
 
     m = makim.Makim()
@@ -199,58 +253,63 @@ def test_conditional_hooks_evaluate_against_parent_context(
 ) -> None:
     """Conditional hook `if:` checks must resolve parent vars and env."""
     events_file = tmp_path / 'cond_events.jsonl'
+    events_posix = events_file.as_posix()
     cfg = _write_config(
         tmp_path,
         f"""
-groups:
-  helper:
-    vars:
-      env_name: "staging"
-      helper_only: "yes"
-    env:
-      RELEASE_MODE: "staging"
-    tasks:
-      prep:
-        vars:
-          prep_only: "yes"
-        backend: bash
-        run: echo "prep" >> "{events_file}"
-      should-skip:
-        backend: bash
-        run: echo "wrongly_ran" >> "{events_file}"
-      should-run:
-        args:
-          mode:
-            type: string
-            help: release mode
-        backend: bash
-        run: echo "cond:${{{{ args.mode }}}}" >> "{events_file}"
-  deploy:
-    vars:
-      env_name: "prod"
-    env:
-      RELEASE_MODE: "prod"
-    tasks:
-      ship:
-        vars:
-          ship_ready: "yes"
-        hooks:
-          pre-run:
-            - task: helper.prep
-            - task: helper.should-skip
-              if: ${{{{ vars.env_name == "staging" }}}}
-            - task: helper.should-run
-              if: >-
-                ${{{{
-                  vars.env_name == "prod"
-                  and vars.ship_ready == "yes"
-                  and env.RELEASE_MODE == "prod"
-                }}}}
-              args:
-                mode: "${{{{ env.RELEASE_MODE }}}}"
-        backend: bash
-        run: echo "main" >> "{events_file}"
-""",
+        groups:
+          helper:
+            vars:
+              env_name: "staging"
+              helper_only: "yes"
+            env:
+              RELEASE_MODE: "staging"
+            tasks:
+              prep:
+                vars:
+                  prep_only: "yes"
+                run: |
+                  with open({events_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('prep\\n')
+              should-skip:
+                run: |
+                  with open({events_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('wrongly_ran\\n')
+              should-run:
+                args:
+                  mode:
+                    type: string
+                    help: release mode
+                run: |
+                  with open({events_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('cond:${{{{ args.mode }}}}\\n')
+          deploy:
+            vars:
+              env_name: "prod"
+            env:
+              RELEASE_MODE: "prod"
+            tasks:
+              ship:
+                vars:
+                  ship_ready: "yes"
+                hooks:
+                  pre-run:
+                    - task: helper.prep
+                    - task: helper.should-skip
+                      if: ${{{{ vars.env_name == "staging" }}}}
+                    - task: helper.should-run
+                      if: >-
+                        ${{{{
+                          vars.env_name == "prod"
+                          and vars.ship_ready == "yes"
+                          and env.RELEASE_MODE == "prod"
+                        }}}}
+                      args:
+                        mode: "${{{{ env.RELEASE_MODE }}}}"
+                run: |
+                  with open({events_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('main\\n')
+        """,
     )
 
     m = makim.Makim()
@@ -266,53 +325,57 @@ def test_post_run_hooks_preserve_parent_context_across_multiple_hooks(
 ) -> None:
     """Sequential post-run hooks must not mutate parent vars or env."""
     out_file = tmp_path / 'post_run.txt'
+    out_posix = out_file.as_posix()
     cfg = _write_config(
         tmp_path,
         f"""
-groups:
-  helper:
-    vars:
-      scope_tag: "helper_scope"
-    env:
-      AUDIT_TARGET: "wrong_helper"
-    tasks:
-      notify-one:
-        vars:
-          step_var: "notify1"
-        env:
-          AUDIT_TARGET: "wrong_notify1"
-        backend: bash
-        run: echo "post1:${{{{ vars.step_var }}}}" >> "{out_file}"
-      notify-two:
-        args:
-          audit:
-            type: string
-            help: Audit target from parent env
-        backend: bash
-        run: echo "post2:${{{{ args.audit }}}}" >> "{out_file}"
-  deploy:
-    vars:
-      scope_tag: "deploy_scope"
-    env:
-      AUDIT_TARGET: "prod_audit"
-    tasks:
-      ship:
-        vars:
-          task_tag: "ship_tag"
-        hooks:
-          post-run:
-            - task: helper.notify-one
-            - task: helper.notify-two
-              if: >-
-                ${{{{
-                  vars.scope_tag == "deploy_scope"
-                  and vars.task_tag == "ship_tag"
-                }}}}
-              args:
-                audit: "${{{{ env.AUDIT_TARGET }}}}"
-        backend: bash
-        run: echo "main" >> "{out_file}"
-""",
+        groups:
+          helper:
+            vars:
+              scope_tag: "helper_scope"
+            env:
+              AUDIT_TARGET: "wrong_helper"
+            tasks:
+              notify-one:
+                vars:
+                  step_var: "notify1"
+                env:
+                  AUDIT_TARGET: "wrong_notify1"
+                run: |
+                  with open({out_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('post1:${{{{ vars.step_var }}}}\\n')
+              notify-two:
+                args:
+                  audit:
+                    type: string
+                    help: Audit target from parent env
+                run: |
+                  with open({out_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('post2:${{{{ args.audit }}}}\\n')
+          deploy:
+            vars:
+              scope_tag: "deploy_scope"
+            env:
+              AUDIT_TARGET: "prod_audit"
+            tasks:
+              ship:
+                vars:
+                  task_tag: "ship_tag"
+                hooks:
+                  post-run:
+                    - task: helper.notify-one
+                    - task: helper.notify-two
+                      if: >-
+                        ${{{{
+                          vars.scope_tag == "deploy_scope"
+                          and vars.task_tag == "ship_tag"
+                        }}}}
+                      args:
+                        audit: "${{{{ env.AUDIT_TARGET }}}}"
+                run: |
+                  with open({out_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('main\\n')
+        """,
     )
 
     m = makim.Makim()
@@ -329,15 +392,14 @@ def test_failure_hooks_preserve_parent_context_across_multiple_hooks(
 ) -> None:
     """Sequential failure hooks see parent vars/env on command/pre-run fail."""
     out_file = tmp_path / 'failure_hooks.txt'
+    out_posix = out_file.as_posix()
     pre_run_block = (
-        """          pre-run:
-            - task: helper.bad-prerun
-"""
+        '          pre-run:\n            - task: helper.bad-prerun\n'
         if failure_origin == 'pre_run'
         else ''
     )
-    main_cmd = (
-        'exit 1' if failure_origin == 'command' else 'echo "unreachable"'
+    ship_remote = (
+        '        remote: missing-host\n' if failure_origin == 'command' else ''
     )
     cfg = _write_config(
         tmp_path,
@@ -352,25 +414,27 @@ groups:
       bad-prerun:
         retry:
           count: 1
-        backend: bash
-        run: exit 1
+        remote: missing-host
+        run: print('never')
       alert-one:
         vars:
           local_msg: "first_alert"
         env:
           ALERT_ENV: "corrupted_alert"
           LEAKED_ALERT: "should_not_leak"
-        backend: bash
-        run: echo "fail1:${{{{ vars.local_msg }}}}" >> "{out_file}"
+        run: |
+          with open({out_posix!r}, 'a', encoding='utf-8') as f:
+              f.write('fail1:${{{{ vars.local_msg }}}}\\n')
       alert-two:
         args:
           channel-env:
             type: string
             help: Alert environment from failed parent task
-        backend: bash
         run: |
-          val="${{{{ args.channel_env }}}}:${{LEAKED_ALERT:-clean}}"
-          echo "fail2:${{val}}" >> "{out_file}"
+          import os
+          leaked = os.environ.get('LEAKED_ALERT', 'clean')
+          with open({out_posix!r}, 'a', encoding='utf-8') as f:
+              f.write('fail2:${{{{ args.channel_env }}}}:' + leaked + '\\n')
   deploy:
     vars:
       alert_channel: "prod_pager"
@@ -391,8 +455,7 @@ groups:
                 }}}}
               args:
                 channel-env: "${{{{ env.ALERT_ENV }}}}"
-        backend: bash
-        run: {main_cmd}
+{ship_remote}        run: print('unreachable')
 """,
     )
 
@@ -411,17 +474,7 @@ def test_hook_ignored_failure_preserves_next_hook_and_parent(
 ) -> None:
     """Failing Hook 1 with ignore-errors leaves Hook 2 and parent intact."""
     out_file = tmp_path / 'exc_isolation.txt'
-    cfg = _write_config(
-        tmp_path,
-        f"""
-groups:
-  helper:
-    vars:
-      mode: "helper"
-    env:
-      EXEC_MODE: "corrupted_helper"
-    tasks:
-      failing-hook:
+    failing_hook_extra = """
         options:
           ignore-errors: true
         vars:
@@ -429,40 +482,11 @@ groups:
         env:
           EXEC_MODE: "corrupted_env"
           POISON: "from_failing_hook"
-        backend: bash
-        run: exit 1
-      verify-after:
-        args:
-          mode-arg:
-            type: string
-            help: Mode arg from parent env
-        backend: bash
-        run: |
-          res="${{{{ args.mode_arg }}}}:${{POISON:-clean}}"
-          echo "after:${{res}}" >> "{out_file}"
-  deploy:
-    vars:
-      mode: "parent"
-    env:
-      EXEC_MODE: "prod_mode"
-    tasks:
-      ship:
-        vars:
-          parent_only: "yes"
-        hooks:
-          pre-run:
-            - task: helper.failing-hook
-            - task: helper.verify-after
-              if: >-
-                ${{{{
-                  vars.mode == "parent"
-                  and vars.parent_only == "yes"
-                }}}}
-              args:
-                mode-arg: "${{{{ env.EXEC_MODE }}}}"
-        backend: bash
-        run: echo "parent:${{POISON:-clean}}" >> "{out_file}"
-""",
+        remote: missing-host
+        run: print("never")
+    """
+    cfg = _write_failing_hook_isolation_config(
+        tmp_path, out_file, failing_hook_extra
     )
 
     m_cmd_fail = makim.Makim()
@@ -480,58 +504,13 @@ def test_hook_raised_exception_isolation(
 ) -> None:
     """Unhandled exception inside Hook 1 preserves Hook 2 and parent state."""
     out_file = tmp_path / 'raised_exc.txt'
-    ignore_block = (
-        """        options:
-          ignore-errors: true
-"""
-        if ignore_errors
-        else ''
-    )
-    cfg = _write_config(
-        tmp_path,
-        f"""
-groups:
-  helper:
-    vars:
-      mode: "helper"
-    env:
-      EXEC_MODE: "corrupted_helper"
-    tasks:
-      failing-hook:
-{ignore_block}        backend: bash
-        run: echo "never"
-      verify-after:
-        args:
-          mode-arg:
-            type: string
-            help: Mode arg from parent env
-        backend: bash
-        run: |
-          res="${{{{ args.mode_arg }}}}:${{POISON:-clean}}"
-          echo "after:${{res}}" >> "{out_file}"
-  deploy:
-    vars:
-      mode: "parent"
-    env:
-      EXEC_MODE: "prod_mode"
-    tasks:
-      ship:
-        vars:
-          parent_only: "yes"
-        hooks:
-          pre-run:
-            - task: helper.failing-hook
-            - task: helper.verify-after
-              if: >-
-                ${{{{
-                  vars.mode == "parent"
-                  and vars.parent_only == "yes"
-                }}}}
-              args:
-                mode-arg: "${{{{ env.EXEC_MODE }}}}"
-        backend: bash
-        run: echo "parent:${{POISON:-clean}}" >> "{out_file}"
-""",
+    failing_hook_extra = 'run: print("never")\n'
+    if ignore_errors:
+        failing_hook_extra = (
+            'options:\n  ignore-errors: true\n' + failing_hook_extra
+        )
+    cfg = _write_failing_hook_isolation_config(
+        tmp_path, out_file, failing_hook_extra
     )
 
     orig_run = makim.Makim.run
@@ -561,40 +540,43 @@ groups:
 def test_single_hook_compatibility(tmp_path: Path) -> None:
     """Single-hook pre-run and post-run preserve baseline behavior."""
     out_file = tmp_path / 'single_compat.txt'
+    out_posix = out_file.as_posix()
     cfg = _write_config(
         tmp_path,
         f"""
-groups:
-  mid:
-    tasks:
-      single:
-        args:
-          tag:
-            type: string
-            help: tag from parent
-        backend: bash
-        run: echo "single:${{{{ args.tag }}}}" >> "{out_file}"
-  top:
-    vars:
-      owner: "top_group"
-    env:
-      LAYER: "top_env"
-    tasks:
-      single-parent:
-        hooks:
-          pre-run:
-            - task: mid.single
-              if: ${{{{ vars.owner == "top_group" }}}}
-              args:
-                tag: "${{{{ env.LAYER }}}}"
-          post-run:
-            - task: mid.single
-              if: ${{{{ vars.owner == "top_group" }}}}
-              args:
-                tag: "${{{{ env.LAYER }}}}"
-        backend: bash
-        run: echo "top-single" >> "{out_file}"
-""",
+        groups:
+          mid:
+            tasks:
+              single:
+                args:
+                  tag:
+                    type: string
+                    help: tag from parent
+                run: |
+                  with open({out_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('single:${{{{ args.tag }}}}\\n')
+          top:
+            vars:
+              owner: "top_group"
+            env:
+              LAYER: "top_env"
+            tasks:
+              single-parent:
+                hooks:
+                  pre-run:
+                    - task: mid.single
+                      if: ${{{{ vars.owner == "top_group" }}}}
+                      args:
+                        tag: "${{{{ env.LAYER }}}}"
+                  post-run:
+                    - task: mid.single
+                      if: ${{{{ vars.owner == "top_group" }}}}
+                      args:
+                        tag: "${{{{ env.LAYER }}}}"
+                run: |
+                  with open({out_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('top-single\\n')
+        """,
     )
 
     m = makim.Makim()
@@ -610,80 +592,88 @@ groups:
 def test_nested_multi_hooks_isolation(tmp_path: Path) -> None:
     """Nested multi-hooks keep inner and outer scopes isolated."""
     out_file = tmp_path / 'nested_compat.txt'
+    out_posix = out_file.as_posix()
     cfg = _write_config(
         tmp_path,
         f"""
-groups:
-  leaf:
-    vars:
-      owner: "leaf_group"
-    env:
-      LAYER: "leaf_env"
-    tasks:
-      step-a:
-        env:
-          LAYER: "corrupted_leaf_a"
-        backend: bash
-        run: echo "leaf-a" >> "{out_file}"
-      step-b:
-        args:
-          layer:
-            type: string
-            help: layer env
-        backend: bash
-        run: echo "leaf-b:${{{{ args.layer }}}}" >> "{out_file}"
-  mid:
-    vars:
-      owner: "mid_group"
-    env:
-      LAYER: "mid_env"
-    tasks:
-      parent-hook-1:
-        vars:
-          mid_tag: "mid_only"
-        env:
-          LAYER: "mid_task_env"
-        hooks:
-          pre-run:
-            - task: leaf.step-a
-            - task: leaf.step-b
-              if: >-
-                ${{{{
-                  vars.owner == "mid_group" and vars.mid_tag == "mid_only"
-                }}}}
-              args:
-                layer: "${{{{ env.LAYER }}}}"
-        backend: bash
-        run: echo "mid-1" >> "{out_file}"
-      parent-hook-2:
-        args:
-          layer:
-            type: string
-            help: top layer env
-        backend: bash
-        run: echo "top-2:${{{{ args.layer }}}}" >> "{out_file}"
-  top:
-    vars:
-      owner: "top_group"
-    env:
-      LAYER: "top_env"
-    tasks:
-      nested-parent:
-        vars:
-          top_tag: "top_only"
-        hooks:
-          pre-run:
-            - task: mid.parent-hook-1
-            - task: mid.parent-hook-2
-              if: >-
-                ${{{{
-                  vars.owner == "top_group" and vars.top_tag == "top_only"
-                }}}}
-              args:
-                layer: "${{{{ env.LAYER }}}}"
-        backend: bash
-        run: echo "top-main" >> "{out_file}"
-""",
+        groups:
+          leaf:
+            vars:
+              owner: "leaf_group"
+            env:
+              LAYER: "leaf_env"
+            tasks:
+              step-a:
+                env:
+                  LAYER: "corrupted_leaf_a"
+                run: |
+                  with open({out_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('leaf-a\\n')
+              step-b:
+                args:
+                  layer:
+                    type: string
+                    help: layer env
+                run: |
+                  with open({out_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('leaf-b:${{{{ args.layer }}}}\\n')
+          mid:
+            vars:
+              owner: "mid_group"
+            env:
+              LAYER: "mid_env"
+            tasks:
+              parent-hook-1:
+                vars:
+                  mid_tag: "mid_only"
+                env:
+                  LAYER: "mid_task_env"
+                hooks:
+                  pre-run:
+                    - task: leaf.step-a
+                    - task: leaf.step-b
+                      if: >-
+                        ${{{{
+                          vars.owner == "mid_group"
+                          and vars.mid_tag == "mid_only"
+                        }}}}
+                      args:
+                        layer: "${{{{ env.LAYER }}}}"
+                run: |
+                  with open({out_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('mid-1\\n')
+              parent-hook-2:
+                args:
+                  layer:
+                    type: string
+                    help: top layer env
+                run: |
+                  with open({out_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('top-2:${{{{ args.layer }}}}\\n')
+          top:
+            vars:
+              owner: "top_group"
+            env:
+              LAYER: "top_env"
+            tasks:
+              nested-parent:
+                vars:
+                  top_tag: "top_only"
+                hooks:
+                  pre-run:
+                    - task: mid.parent-hook-1
+                    - task: mid.parent-hook-2
+                      if: >-
+                        ${{{{
+                          vars.owner == "top_group"
+                          and vars.top_tag == "top_only"
+                        }}}}
+                      args:
+                        layer: "${{{{ env.LAYER }}}}"
+                run: |
+                  with open({out_posix!r}, 'a', encoding='utf-8') as f:
+                      f.write('top-main\\n')
+        """,
     )
 
     m = makim.Makim()
@@ -703,44 +693,52 @@ def test_cli_multi_hook_preserves_parent_context(tmp_path: Path) -> None:
     cfg = _write_config(
         tmp_path,
         """
-groups:
-  helper:
-    tasks:
-      h1:
-        env:
-          HOOK_ENV: "staging"
-          TARGET_ENV: "staging"
-        backend: bash
-        run: echo "[HOOK 1] parent=${PARENT_ENV} hook=${HOOK_ENV}"
-      h2:
-        env:
-          HOOK_ENV: "testing"
-        args:
-          target:
-            type: string
-            help: parent target env
-        backend: bash
-        run: |
-          arg_val="${{ args.target }}"
-          echo "[HOOK 2] parent=${PARENT_ENV} hook=${HOOK_ENV} arg=${arg_val}"
-  deploy:
-    vars:
-      env_name: "production"
-    env:
-      PARENT_ENV: "production"
-      TARGET_ENV: "production"
-    tasks:
-      run-it:
-        hooks:
-          pre-run:
-            - task: helper.h1
-            - task: helper.h2
-              if: ${{ vars.env_name == "production" }}
-              args:
-                target: "${{ env.TARGET_ENV }}"
-        backend: bash
-        run: echo "[PARENT] completed"
-""",
+        groups:
+          helper:
+            tasks:
+              h1:
+                env:
+                  HOOK_ENV: "staging"
+                  TARGET_ENV: "staging"
+                run: |
+                  import os
+                  p_env = os.environ.get('PARENT_ENV', '')
+                  h_env = os.environ.get('HOOK_ENV', '')
+                  print('[HOOK 1] parent=' + p_env + ' hook=' + h_env)
+              h2:
+                env:
+                  HOOK_ENV: "testing"
+                args:
+                  target:
+                    type: string
+                    help: parent target env
+                run: |
+                  import os
+                  p_env = os.environ.get('PARENT_ENV', '')
+                  h_env = os.environ.get('HOOK_ENV', '')
+                  msg = (
+                      '[HOOK 2] parent=' + p_env
+                      + ' hook=' + h_env
+                      + ' arg=${{ args.target }}'
+                  )
+                  print(msg)
+          deploy:
+            vars:
+              env_name: "production"
+            env:
+              PARENT_ENV: "production"
+              TARGET_ENV: "production"
+            tasks:
+              run-it:
+                hooks:
+                  pre-run:
+                    - task: helper.h1
+                    - task: helper.h2
+                      if: ${{ vars.env_name == "production" }}
+                      args:
+                        target: "${{ env.TARGET_ENV }}"
+                run: print('[PARENT] completed')
+        """,
     )
 
     res = subprocess.run(
