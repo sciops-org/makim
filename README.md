@@ -140,13 +140,24 @@ your drive, and then you can modify and execute the code as needed:
 
 ### Help keep useful automation accessible
 
-Makim makes everyday development tasks easier to define, share, and run. The value of a good automation tool is that it keeps working as projects, environments, and dependencies evolve. Financial support helps create time for maintaining existing features, improving reliability, testing supported workflows, and making the documentation clearer for newcomers.
+Makim makes everyday development tasks easier to define, share, and run. The
+value of a good automation tool is that it keeps working as projects,
+environments, and dependencies evolve. Financial support helps create time for
+maintaining existing features, improving reliability, testing supported
+workflows, and making the documentation clearer for newcomers.
 
-**[Support Makim development on Open Collective](https://opencollective.com/osl/projects/makim/donate?interval=month&amount=20&name=&legalName=&email=)**. One-time and recurring contributions are welcome; even modest support helps sustain the work.
+**[Support Makim development on Open Collective](https://opencollective.com/osl/projects/makim/donate?interval=month&amount=20&name=&legalName=&email=)**.
+One-time and recurring contributions are welcome; even modest support helps
+sustain the work.
 
 ### The people and organizations behind the work
 
-Makim is developed and maintained through [SciStitch](https://scistitch.com/), together with its open-source contributors. We thank [Open Science Labs (OSL)](https://opensciencelabs.org/) for its institutional support, and everyone who writes code, reports issues, reviews changes, shares ideas, or uses Makim in their projects. Your participation helps make the tool better for others.
+Makim is developed and maintained through [SciStitch](https://scistitch.com/),
+together with its open-source contributors. We thank
+[Open Science Labs (OSL)](https://opensciencelabs.org/) for its institutional
+support, and everyone who writes code, reports issues, reviews changes, shares
+ideas, or uses Makim in their projects. Your participation helps make the tool
+better for others.
 
 <p>
   <a href="https://scistitch.com/"><img src="https://scistitch.com/images/logo/wordmark-color.svg" alt="SciStitch" width="160" style="background: #fff; border-radius: 6px; padding: 6px 8px;"></a>
