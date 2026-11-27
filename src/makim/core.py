@@ -957,7 +957,10 @@ class Makim:
         hook_task_name = hook_data['task']
 
         try:
-            return bool(makim_hook.run(deepcopy(args_hook)))
+            # Isolate each hook run so _change_task()/run() mutations cannot
+            # leak into subsequent hooks or the exception handler below.
+            hook_runner = deepcopy(makim_hook)
+            return bool(hook_runner.run(deepcopy(args_hook)))
         except Exception as e:
             hook_task_copy = deepcopy(makim_hook)
             hook_task_copy._change_task(hook_task_name)
